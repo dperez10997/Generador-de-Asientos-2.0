@@ -143,7 +143,7 @@ def normalize_row(row):
                 gl_year_val = ""
     else:
         try:
-            gl_year_val = str(int(float(gl_year_val))))
+            gl_year_val = str(int(float(gl_year_val)))
         except Exception:
             s = parse_date_any(trx_date_raw, month=gl_month, year=None)
             if s:
@@ -413,7 +413,7 @@ if run:
         else:
             df_in = pd.read_excel(file, dtype=str)
 
-        # ➜ NUEVO: eliminar filas completamente vacías del Billing original
+        # Eliminar filas completamente vacías del Billing original
         df_in = drop_empty_rows(df_in)
 
         st.subheader("Vista previa - Billing original")
@@ -423,7 +423,7 @@ if run:
         missing = ensure_headers(df_in.copy())
         df_req = transform_billing_to_required(df_in) if missing else df_in.copy()
 
-        # ➜ NUEVO: eliminar filas vacías/sin monto del formateado
+        # Eliminar filas vacías/sin monto del formateado
         df_req = drop_empty_transformed(df_req)
 
         st.subheader("Vista previa - Billing_formateado (intermedio)")
