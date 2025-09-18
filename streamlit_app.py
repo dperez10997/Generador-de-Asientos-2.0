@@ -37,7 +37,7 @@ def parse_date_any(v, month=None, year=None) -> str:
     """
     Devuelve MM/DD/YYYY o "" si no puede.
     - Acepta NaN/None
-    - Acepta seriales de Excel (número)
+    - Acepta seriales de Excel
     - Usa pandas.to_datetime con dayfirst False/True
     - Si no hay fecha pero hay mes/año -> último día del mes
     """
@@ -53,7 +53,7 @@ def parse_date_any(v, month=None, year=None) -> str:
 
     s = str(v).strip()
 
-    # 1) ¿Serial de Excel?
+    # 1) Serial Excel
     try:
         num = float(s)
         if not math.isnan(num) and 1 <= num <= 80000:
@@ -63,7 +63,7 @@ def parse_date_any(v, month=None, year=None) -> str:
     except Exception:
         pass
 
-    # 2) pandas.to_datetime (infer + dayfirst variando)
+    # 2) pandas.to_datetime (infer + dayfirst)
     for day_first in (False, True):
         try:
             dt = pd.to_datetime(s, dayfirst=day_first, errors="coerce", utc=False, infer_datetime_format=True)
@@ -76,7 +76,7 @@ def parse_date_any(v, month=None, year=None) -> str:
         except Exception:
             continue
 
-    # 3) YYYYMMDD crudo
+    # 3) YYYYMMDD
     if len(s) == 8 and s.isdigit():
         try:
             y, m, d = int(s[0:4]), int(s[4:6]), int(s[6:8])
@@ -84,7 +84,7 @@ def parse_date_any(v, month=None, year=None) -> str:
         except Exception:
             pass
 
-    return ""  # nunca lanzamos excepción
+    return ""  # nunca lanzar excepción
 
 def fmt_amount(x):
     s = str(x).strip()
@@ -98,25 +98,73 @@ def ensure_headers(df):
     df.columns = [str(c).strip() for c in df.columns]
     return [c for c in REQUIRED_COLUMNS if c not in df.columns]
 
-def month_name_es(m):
-    m_int = int(float(m))
-    if m_int not in MONTHS_ES: raise ValueError(f"GL_Month fuera de 1-12: {m}")
-    return MONTHS_ES[m_int], str(m_int)
+def month_name_es(m, trx_date=None):
+    """
+    Devuelve (nombre_mes, mes_str). Si m viene vacío/invalid,
+    intenta inferirlo desde trx_date (cualquier formato soportado).
+    Si no logra inferir, devuelve ("","") sin lanzar excepción.
+    """
+    # 1) intento directo
+    try:
+        m_int = int(float(str(m).strip()))
+        if 1 <= m_int <= 12:
+            return MONTHS_ES[m_int], str(m_int)
+    except Exception:
+        pass
+
+    # 2) inferir desde fecha
+    s = parse_date_any(trx_date) if trx_date is not None else ""
+    if s:
+        try:
+            dt = datetime.strptime(s, "%m/%d/%Y")
+            m_int = dt.month
+            return MONTHS_ES[m_int], str(m_int)
+        except Exception:
+            pass
+
+    # 3) no se pudo
+    return "", ""
 
 def normalize_row(row):
-    gl_account = str(row['GL_Account']).strip()
-    mes_nombre, gl_month = month_name_es(row['GL_Month'])
-    gl_year = str(int(float(row['GL_Year']))) if str(row['GL_Year']).strip()!='' else ''
+    gl_account = str(row.get('GL_Account', '')).strip()
+
+    # Mes (infiere desde fecha si viene vacío)
+    trx_date_raw = row.get('TransactionDate')
+    mes_nombre, gl_month = month_name_es(row.get('GL_Month'), trx_date_raw)
+
+    # Año (intenta directo; si no, inferir desde fecha)
+    gl_year_val = str(row.get('GL_Year', '')).strip()
+    if gl_year_val == "":
+        s = parse_date_any(trx_date_raw, month=gl_month, year=None)
+        if s:
+            try:
+                gl_year_val = str(datetime.strptime(s, "%m/%d/%Y").year)
+            except Exception:
+                gl_year_val = ""
+    else:
+        try:
+            gl_year_val = str(int(float(gl_year_val)))
+        except Exception:
+            s = parse_date_any(trx_date_raw, month=gl_month, year=None)
+            if s:
+                try:
+                    gl_year_val = str(datetime.strptime(s, "%m/%d/%Y").year)
+                except Exception:
+                    gl_year_val = ""
+
     gl_group = strip_accents(str(row.get('GL_Group','')).strip())
-    trx_date = parse_date_any(row.get('TransactionDate'), month=row.get('GL_Month'), year=row.get('GL_Year'))
-    debit = fmt_amount(row['DebitAmount'])
-    credit = fmt_amount(row['CreditAmount'])
-    job = str(row['JobNumber']).strip()
-    gl_note = strip_accents(f"Provisión {mes_nombre}")
-    gl_reference = strip_accents(f"Provisión producción {mes_nombre} {gl_year}")
+    trx_date = parse_date_any(trx_date_raw, month=gl_month, year=gl_year_val if gl_year_val else None)
+    debit = fmt_amount(row.get('DebitAmount', 0))
+    credit = fmt_amount(row.get('CreditAmount', 0))
+    job = str(row.get('JobNumber', '')).strip()
+    gl_note = strip_accents(f"Provisión {mes_nombre}") if mes_nombre else "Provision"
+    gl_reference = strip_accents(
+        f"Provisión producción {mes_nombre} {gl_year_val}".strip()
+    ) if mes_nombre or gl_year_val else "Provision produccion"
+
     return {
         'GL_Account': gl_account, 'GL_Note': gl_note,
-        'GL_Month': gl_month, 'GL_Year': gl_year, 'GL_Group': gl_group,
+        'GL_Month': gl_month, 'GL_Year': gl_year_val, 'GL_Group': gl_group,
         'TransactionDate': trx_date, 'GL_Reference': gl_reference,
         'DebitAmount': debit, 'CreditAmount': credit, 'JobNumber': job
     }
@@ -135,9 +183,9 @@ def add_auto_offsets(rows, offset_account='1300102.5', agg='total'):
         for _, group in buckets.items():
             total = sum(float(r['CreditAmount']) for r in group); g0 = group[0]
             if agg == 'total':
-                mes_nombre, _ = month_name_es(g0['GL_Month']); anno = g0['GL_Year']
-                gl_note = strip_accents(f"Provisión {mes_nombre}")
-                gl_ref  = strip_accents(f"Provisión producción {mes_nombre} {anno}")
+                mes_nombre, _ = month_name_es(g0['GL_Month'], g0['TransactionDate']); anno = g0['GL_Year']
+                gl_note = strip_accents(f"Provisión {mes_nombre}") if mes_nombre else "Provision"
+                gl_ref  = strip_accents(f"Provisión producción {mes_nombre} {anno}".strip()) if mes_nombre or anno else "Provision produccion"
             else:
                 gl_note, gl_ref = g0['GL_Note'], g0['GL_Reference']
             added.append({**g0, 'GL_Account': offset_account, 'GL_Note': gl_note,
@@ -218,8 +266,8 @@ def transform_billing_to_required(df_raw):
     out = out[REQUIRED_COLUMNS].copy()
 
     def _int_or_blank(x):
-        sx=str(x).strip()
-        if sx in ("","nan","none","None","NaN"): return ""
+        sx=str(x).strip().lower()
+        if sx in ("","nan","none","null"): return ""
         return int(float(sx))
     out["GL_Month"] = out["GL_Month"].apply(_int_or_blank)
     out["GL_Year"]  = out["GL_Year"].apply(_int_or_blank)
