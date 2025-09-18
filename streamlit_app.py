@@ -2,6 +2,7 @@
 import io, os, re, unicodedata
 from datetime import datetime, timedelta
 from collections import defaultdict
+from pathlib import Path
 import pandas as pd
 import streamlit as st
 
@@ -17,9 +18,9 @@ st.markdown(
     unsafe_allow_html=True
 )
 st.title("Generador de Asientos Producción")
-st.caption("Sube tu Excel/CSV (Billing original). La app lo transforma al formato requerido y genera el TXT tabulado.")
+st.caption("Sube tu Excel/CSV (Billing original), presiona **Ejecutar** y descarga el TXT tabulado.")
 
-# ---------- Utils ----------
+# ---------- Constantes / Utils ----------
 REQUIRED_COLUMNS = [
     'GL_Account','GL_Month','GL_Year','GL_Group',
     'TransactionDate','DebitAmount','CreditAmount','JobNumber'
@@ -33,12 +34,12 @@ MONTHS_ES = {
     7:'Julio',8:'Agosto',9:'Septiembre',10:'Octubre',11:'Noviembre',12:'Diciembre'
 }
 
-def strip_accents(t):
-    if t is None: return ''
-    return ''.join(ch for ch in unicodedata.normalize('NFD', str(t)) if not unicodedata.combining(ch))
+def strip_accents(s):
+    if s is None: return ''
+    return ''.join(ch for ch in unicodedata.normalize('NFD', str(s)) if not unicodedata.combining(ch))
 
 def parse_date(v):
-    """Normaliza fechas a MM/DD/YYYY (la salida.txt usa este formato)."""
+    """Normaliza a MM/DD/YYYY (lo que usa salida.txt)."""
     if v is None or str(v).strip()=='':
         raise ValueError("Fecha vacía")
     s = str(v).strip().replace('T',' ').split('.')[0]
@@ -71,16 +72,11 @@ def fmt_amount(x):
 
 def ensure_headers(df):
     df.columns = [str(c).strip() for c in df.columns]
-    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
-    return missing
+    return [c for c in REQUIRED_COLUMNS if c not in df.columns]
 
 def month_name_es(m):
-    try:
-        m_int = int(float(m))
-    except Exception:
-        raise ValueError(f"GL_Month inválido: {m}")
-    if m_int not in MONTHS_ES:
-        raise ValueError(f"GL_Month fuera de rango (1-12): {m}")
+    m_int = int(float(m))
+    if m_int not in MONTHS_ES: raise ValueError(f"GL_Month fuera de 1-12: {m}")
     return MONTHS_ES[m_int], str(m_int)
 
 def normalize_row(row):
@@ -102,53 +98,35 @@ def normalize_row(row):
     }
 
 def add_auto_offsets(rows, offset_account='1300102.5', agg='total'):
+    """
+    Contrapartidas:
+      - total: UNA por el total (nota/ref auto por mes/año).
+      - none: espejo por cada crédito 8xxxx.
+      - by_ref / by_job: agrupa por referencia o JobNumber.
+    """
     base_rows = [normalize_row(r) for r in rows]
     credits = [r for r in base_rows if r['GL_Account'].strip().startswith('8') and float(r['CreditAmount'])>0.0]
     added = []
-
     if agg == 'none':
         for r in credits:
-            added.append({
-                **r, 'GL_Account': offset_account,
-                'DebitAmount': r['CreditAmount'], 'CreditAmount': '0.00'
-            })
-
+            added.append({**r, 'GL_Account': offset_account,
+                          'DebitAmount': r['CreditAmount'], 'CreditAmount': '0.00'})
     elif agg in ('total','by_ref','by_job'):
         buckets = defaultdict(list)
-        if agg == 'total':
-            keyfn = lambda r: 'TOTAL'
-        elif agg == 'by_ref':
-            keyfn = lambda r: r['GL_Reference']
-        else:  # by_job
-            keyfn = lambda r: r['JobNumber']
-
-        for r in credits:
-            buckets[keyfn(r)].append(r)
-
+        keyfn = (lambda r: 'TOTAL') if agg=='total' else (lambda r: r['GL_Reference'] if agg=='by_ref' else r['JobNumber'])
+        for r in credits: buckets[keyfn(r)].append(r)
         for _, group in buckets.items():
-            total = sum(float(r['CreditAmount']) for r in group)
-            g0 = group[0]
-
+            total = sum(float(r['CreditAmount']) for r in group); g0 = group[0]
             if agg == 'total':
-                mes_nombre, _ = month_name_es(g0['GL_Month'])
-                anno = g0['GL_Year']
+                mes_nombre, _ = month_name_es(g0['GL_Month']); anno = g0['GL_Year']
                 gl_note = strip_accents(f"Provisión {mes_nombre}")
                 gl_ref  = strip_accents(f"Provisión producción {mes_nombre} {anno}")
             else:
-                gl_note = g0['GL_Note']
-                gl_ref  = g0['GL_Reference']
-
-            added.append({
-                **g0,
-                'GL_Account': offset_account,
-                'GL_Note': gl_note,
-                'GL_Reference': gl_ref,
-                'DebitAmount': f"{total:.2f}",
-                'CreditAmount': '0.00'
-            })
+                gl_note, gl_ref = g0['GL_Note'], g0['GL_Reference']
+            added.append({**g0, 'GL_Account': offset_account, 'GL_Note': gl_note,
+                          'GL_Reference': gl_ref, 'DebitAmount': f"{total:.2f}", 'CreditAmount': '0.00'})
     else:
-        raise ValueError("Valor inválido para 'agg'")
-
+        raise ValueError("agg inválido")
     return base_rows + added
 
 def totals(rows):
@@ -156,8 +134,9 @@ def totals(rows):
     c = sum(float(r['CreditAmount']) for r in rows)
     return d, c, round(d-c,2)
 
-# ---------- Lectores auxiliares ----------
+# ---------- Lectores CSV ----------
 def read_any_csv(file_bytes):
+    """CSV del Billing: autodetecta separador y prueba encodings comunes."""
     for enc in ('utf-8-sig','cp1252','latin1'):
         try:
             text = file_bytes.decode(enc, errors='strict')
@@ -178,11 +157,9 @@ def normalize_cols(cols):
         out.append(c0)
     return out
 
-# ---------- Transformador de Billing original -> columnas requeridas ----------
+# ---------- Transformador Billing -> requerido ----------
 def transform_billing_to_required(df_raw):
-    df = df_raw.copy()
-    df.columns = normalize_cols(df.columns)
-
+    df = df_raw.copy(); df.columns = normalize_cols(df.columns)
     candidates = {
         "codigo": ["codigo","código","gl_account","cuenta","cuenta_contable","account","codigo_cuenta","cta_contable"],
         "mes":    ["mes","gl_month","periodo_mes","periodo","period"],
@@ -190,80 +167,169 @@ def transform_billing_to_required(df_raw):
         "venta":  ["venta","creditamount","credito","crédito","monto_venta","monto","importe","total","valor","neto"],
         "trabajo":["trabajo","jobnumber","job","proyecto","orden_de_trabajo","ot","orden_trabajo","job_number"]
     }
-
-    def pick(col_aliases):
-        for a in col_aliases:
-            if a in df.columns:
-                return a
+    def pick(keys):
+        for k in keys:
+            if k in df.columns: return k
         return None
 
-    col_codigo = pick(candidates["codigo"])
-    col_mes    = pick(candidates["mes"])
-    col_fecha  = pick(candidates["fecha"])
-    col_venta  = pick(candidates["venta"])
-    col_trab   = pick(candidates["trabajo"])
+    c_codigo = pick(candidates["codigo"]); c_mes = pick(candidates["mes"])
+    c_fecha = pick(candidates["fecha"]);   c_venta = pick(candidates["venta"])
+    c_trab  = pick(candidates["trabajo"])
 
     out = pd.DataFrame()
-    out["GL_Account"] = df[col_codigo] if col_codigo else ""
+    out["GL_Account"] = df[c_codigo] if c_codigo else ""
 
-    if col_fecha:
-        fechas_norm = df[col_fecha].apply(lambda v: parse_date(v) if str(v).strip()!="" else "")
+    if c_fecha:
+        fechas_norm = df[c_fecha].apply(lambda v: parse_date(v) if str(v).strip()!="" else "")
         out["TransactionDate"] = fechas_norm
 
-        def year_from_str(s):
-            try:
-                dt = datetime.strptime(s, "%m/%d/%Y"); return dt.year
-            except Exception:
-                return ""
-        out["GL_Year"] = fechas_norm.apply(year_from_str)
+        def _year(s):
+            try: return datetime.strptime(s, "%m/%d/%Y").year
+            except Exception: return ""
+        out["GL_Year"] = fechas_norm.apply(_year)
 
-        if col_mes:
-            out["GL_Month"] = df[col_mes]
+        if c_mes:
+            out["GL_Month"] = df[c_mes]
         else:
-            def month_from_str(s):
-                try:
-                    dt = datetime.strptime(s, "%m/%d/%Y"); return dt.month
-                except Exception:
-                    return ""
-            out["GL_Month"] = fechas_norm.apply(month_from_str)
+            def _month(s):
+                try: return datetime.strptime(s, "%m/%d/%Y").month
+                except Exception: return ""
+            out["GL_Month"] = fechas_norm.apply(_month)
     else:
-        out["TransactionDate"] = ""
-        out["GL_Year"] = ""
-        out["GL_Month"] = ""
+        out["TransactionDate"] = ""; out["GL_Year"] = ""; out["GL_Month"] = ""
 
     out["GL_Group"] = ""
     out["DebitAmount"] = 0
-
-    if col_venta:
-        out["CreditAmount"] = pd.to_numeric(df[col_venta].astype(str).str.replace(" ","").str.replace(",",""), errors="coerce").fillna(0)
-    else:
-        out["CreditAmount"] = 0
-
-    out["JobNumber"] = df[col_trab] if col_trab else ""
+    out["CreditAmount"] = (pd.to_numeric(
+        df[c_venta].astype(str).str.replace(" ","").str.replace(",",""),
+        errors="coerce").fillna(0) if c_venta else 0)
+    out["JobNumber"] = df[c_trab] if c_trab else ""
 
     out = out[REQUIRED_COLUMNS].copy()
-    # tipos
-    def _to_int_or_blank(x):
-        sx = str(x).strip()
+
+    def _int_or_blank(x):
+        sx=str(x).strip()
         if sx in ("","nan","None"): return ""
         return int(float(sx))
-    out["GL_Month"] = out["GL_Month"].apply(_to_int_or_blank)
-    out["GL_Year"]  = out["GL_Year"].apply(_to_int_or_blank)
+    out["GL_Month"] = out["GL_Month"].apply(_int_or_blank)
+    out["GL_Year"]  = out["GL_Year"].apply(_int_or_blank)
     return out
+
+# ---------- AGENCIAS: lectura robusta + búsqueda ampliada ----------
+def _read_agency_df(path: Path):
+    """
+    Lee agencias.csv/.xlsx con:
+      - Autodetección de separador (sep=None, engine='python')
+      - Reintentos de encoding (utf-8-sig, cp1252, latin1)
+    """
+    try:
+        if path.suffix.lower() == ".xlsx":
+            return pd.read_excel(path, dtype=str)
+        for enc in ("utf-8-sig", "cp1252", "latin1"):
+            try:
+                return pd.read_csv(path, dtype=str, keep_default_na=False, sep=None, engine="python", encoding=enc)
+            except Exception:
+                continue
+        return None
+    except Exception:
+        return None
+
+def _build_agency_map(df: pd.DataFrame):
+    df = df.copy(); df.columns = normalize_cols(df.columns)
+    ag_cols = [c for c in df.columns if c in ("agencia","cliente","agente","agency","cliente_nombre")]
+    ct_cols = [c for c in df.columns if c in ("cuenta","account","cuenta_contable","num_cuenta")]
+    if not ag_cols or not ct_cols: return {}
+    a, c = ag_cols[0], ct_cols[0]
+    m = {}
+    for _, r in df.iterrows():
+        ag = str(r[a]).strip(); cu = str(r[c]).strip()
+        if ag and cu and cu.lower() != "nan":
+            m[ag] = cu
+    return m
+
+def load_agencies():
+    """
+    Busca agencias.* en:
+      - Directorio del script (__file__): ./, ./data, ./assets
+      - Directorio de trabajo del runtime (cwd): ./, ./data, ./assets
+    """
+    script_base = Path(__file__).parent
+    cwd_base = Path.cwd()
+
+    candidates = [
+        script_base / "agencias.csv",
+        script_base / "agencias.xlsx",
+        script_base / "data" / "agencias.csv",
+        script_base / "data" / "agencias.xlsx",
+        script_base / "assets" / "agencias.csv",
+        script_base / "assets" / "agencias.xlsx",
+        cwd_base / "agencias.csv",
+        cwd_base / "agencias.xlsx",
+        cwd_base / "data" / "agencias.csv",
+        cwd_base / "data" / "agencias.xlsx",
+        cwd_base / "assets" / "agencias.csv",
+        cwd_base / "assets" / "agencias.xlsx",
+    ]
+
+    for p in candidates:
+        if p.exists():
+            df = _read_agency_df(p)
+            if df is not None:
+                m = _build_agency_map(df)
+                if m:
+                    return m, p
+    return {}, None
+
+fixed_agency_map, agency_file_found = load_agencies()
+
+# ---------- UI de agencias ----------
+selected_agency=None
+offset_account_from_agency=None
+use_agency_account=False
+agency_error=False
+
+if fixed_agency_map:
+    cols = st.columns([2,2,2])
+    with cols[0]:
+        selected_agency = st.selectbox("Agencia", sorted(fixed_agency_map.keys()))
+    with cols[1]:
+        use_agency_account = st.checkbox("Usar cuenta según agencia", value=True)
+
+    if use_agency_account and selected_agency:
+        acct = str(fixed_agency_map.get(selected_agency, "")).strip()
+        if not acct:
+            st.error(f"La agencia **{selected_agency}** no tiene una cuenta asignada en la base. Usa la **cuenta manual** en Opciones avanzadas.")
+            use_agency_account = False
+            agency_error = True
+        else:
+            offset_account_from_agency = acct
+            with cols[2]:
+                st.text_input("Cuenta (auto por agencia)", value=acct, disabled=True)
+else:
+    st.info("ℹ️ Coloca **agencias.csv** (o .xlsx) en la raíz del repo (o en /data o /assets) con columnas: Agencia, Cuenta.")
+
+# --- Diagnóstico para el deploy ---
+with st.expander("Diagnóstico agencias", expanded=False):
+    st.write("Archivo detectado:", str(agency_file_found) if agency_file_found else "(no encontrado)")
+    st.write("Agencias cargadas:", len(fixed_agency_map))
+    if len(fixed_agency_map) > 0:
+        st.write("Ejemplos:", list(fixed_agency_map.items())[:5])
 
 # ---------- Uploader y botón ----------
 file = st.file_uploader("Sube tu archivo Billing original (CSV o Excel .xlsx)", type=['csv','xlsx'])
-run = st.button("▶ Ejecutar y generar salida.txt")
+run = st.button("▶ Ejecutar y generar salida.txt", disabled=agency_error)
 
 # ---------- Opciones avanzadas ----------
 with st.expander("Opciones avanzadas (contrapartida y texto)", expanded=False):
     agg = st.selectbox("Tipo de contrapartida", options=['total','none','by_ref','by_job'], index=0)
-    offset_account_manual = st.text_input("Cuenta de contrapartida (manual)", value="1300102.5")
+    auto_offset = st.checkbox("Generar contrapartida automática", value=True)
+    manual_help = "Se usará la cuenta por agencia si está activado arriba." if use_agency_account else "Se usará esta cuenta."
+    offset_account_manual = st.text_input("Cuenta de contrapartida (manual)", value="1300102.5", help=manual_help)
     st.text_input("Nota (si 'total')", value="(Se autogenera: Provisión <Mes>)", disabled=True)
     st.text_input("Referencia (si 'total')", value="(Se autogenera: Provisión producción <Mes> <Año>)", disabled=True)
 
 st.markdown("---")
-st.caption("Puedes subir tu Billing original con columnas como Código, Mes, Fecha, Venta, Trabajo. La app lo transforma al formato mínimo requerido antes de generar el TXT.")
+st.caption("Formato mínimo final: GL_Account, GL_Month, GL_Year, GL_Group, TransactionDate, DebitAmount, CreditAmount, JobNumber. GL_Note y GL_Reference se generan sin tildes.")
 
 # ---------- Ejecutar ----------
 if run:
@@ -272,31 +338,28 @@ if run:
     try:
         # 1) Leer Billing original
         if file.name.lower().endswith('.csv'):
-            raw = file.getvalue()
-            df_in = None
+            raw = file.getvalue(); df_in = None
             for enc in ('utf-8-sig','cp1252','latin1'):
                 try:
                     text = raw.decode(enc, errors='strict')
-                    df_in = pd.read_csv(io.StringIO(text), dtype=str, keep_default_na=False, sep=None, engine='python')
-                    break
+                    df_in = pd.read_csv(io.StringIO(text), dtype=str, keep_default_na=False, sep=None, engine='python'); break
                 except Exception:
                     continue
             if df_in is None:
                 st.error("No pude leer el CSV. Guarda como 'CSV UTF-8' o sube un .xlsx."); st.stop()
         else:
-            # No fuerces engine aquí, deja que pandas use openpyxl si está instalado
             df_in = pd.read_excel(file, dtype=str)
 
         st.subheader("Vista previa - Billing original")
         st.dataframe(df_in.head(20))
 
-        # 2) Transformar si hace falta
+        # 2) Si faltan columnas requeridas, transformar
         missing = ensure_headers(df_in.copy())
         if missing:
             df_req = transform_billing_to_required(df_in)
             missing_after = ensure_headers(df_req.copy())
             if missing_after:
-                st.error("No pude construir todas las columnas requeridas. Revisa que el archivo tenga al menos: Código, Fecha y Venta (y opcionalmente Mes y Trabajo).")
+                st.error("No pude construir todas las columnas requeridas. Asegúrate de tener al menos: Código, Fecha y Venta (y opcionalmente Mes y Trabajo).")
                 st.stop()
         else:
             df_req = df_in.copy()
@@ -306,15 +369,17 @@ if run:
 
         rows = df_req.to_dict(orient='records')
 
-        out_rows = add_auto_offsets(
-            rows,
-            offset_account=offset_account_manual,
-            agg=agg
-        )
+        # 3) Cuenta efectiva (agencia o manual)
+        effective_offset = offset_account_from_agency if (use_agency_account and offset_account_from_agency) else offset_account_manual
+
+        if auto_offset:
+            out_rows = add_auto_offsets(rows, offset_account=effective_offset, agg=agg)
+        else:
+            out_rows = [normalize_row(r) for r in rows]
 
         d, c, diff = totals(out_rows)
 
-        # Construir TXT (tabulado)
+        # 4) Construir TXT tabulado
         out_buffer = io.StringIO()
         for r in out_rows:
             fields = [r['GL_Account'], r['GL_Note'], r['GL_Month'], r['GL_Year'], r['GL_Group'],
