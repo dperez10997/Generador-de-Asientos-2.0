@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-import io, re, unicodedata
+import io, re, unicodedata, math, calendar
 from datetime import datetime, timedelta
 from collections import defaultdict
 from pathlib import Path
@@ -15,36 +15,76 @@ st.markdown(
 st.title("Generador de Asientos Producción")
 st.caption("Sube tu Excel/CSV (Billing original). La app lo transforma al formato requerido y genera el TXT tabulado.")
 
-# ---------- Utils ----------
-REQUIRED_COLUMNS = ['GL_Account','GL_Month','GL_Year','GL_Group','TransactionDate','DebitAmount','CreditAmount','JobNumber']
-DATE_PATTERNS = ['%d/%m/%Y','%m/%d/%Y','%Y-%m-%d','%Y/%m/%d','%d-%m-%Y','%m-%d-%Y','%Y-%m-%d %H:%M:%S','%d/%m/%Y %H:%M:%S','%m/%d/%Y %H:%M:%S']
-MONTHS_ES = {1:'Enero',2:'Febrero',3:'Marzo',4:'Abril',5:'Mayo',6:'Junio',7:'Julio',8:'Agosto',9:'Septiembre',10:'Octubre',11:'Noviembre',12:'Diciembre'}
+# ---------- Constantes / Utils ----------
+REQUIRED_COLUMNS = [
+    'GL_Account','GL_Month','GL_Year','GL_Group',
+    'TransactionDate','DebitAmount','CreditAmount','JobNumber'
+]
+MONTHS_ES = {
+    1:'Enero',2:'Febrero',3:'Marzo',4:'Abril',5:'Mayo',6:'Junio',
+    7:'Julio',8:'Agosto',9:'Septiembre',10:'Octubre',11:'Noviembre',12:'Diciembre'
+}
 
-def strip_accents(t):
-    if t is None: return ''
-    return ''.join(ch for ch in unicodedata.normalize('NFD', str(t)) if not unicodedata.combining(ch))
+def strip_accents(s):
+    if s is None: return ''
+    return ''.join(ch for ch in unicodedata.normalize('NFD', str(s)) if not unicodedata.combining(ch))
 
-def parse_date(v):
-    """Devuelve MM/DD/YYYY (el TXT usa este formato)."""
-    if v is None or str(v).strip()=='':
-        raise ValueError("Fecha vacía")
-    s = str(v).strip().replace('T',' ').split('.')[0]
+def _blank(v) -> bool:
+    s = str(v).strip().lower()
+    return s in ("", "nan", "none", "nat", "null")
+
+def parse_date_any(v, month=None, year=None) -> str:
+    """
+    Devuelve MM/DD/YYYY o "" si no puede.
+    - Acepta NaN/None
+    - Acepta seriales de Excel (número)
+    - Usa pandas.to_datetime con dayfirst False/True
+    - Si no hay fecha pero hay mes/año -> último día del mes
+    """
+    if v is None or _blank(v):
+        if month and year:
+            try:
+                m = int(float(month)); y = int(float(year))
+                last = calendar.monthrange(y, m)[1]
+                return f"{m}/{last}/{y}"
+            except Exception:
+                return ""
+        return ""
+
+    s = str(v).strip()
+
+    # 1) ¿Serial de Excel?
     try:
-        num = float(s); base = datetime(1899,12,30)
-        dt = base + timedelta(days=num)
-        return f"{dt.month}/{dt.day}/{dt.year}"
+        num = float(s)
+        if not math.isnan(num) and 1 <= num <= 80000:
+            base = datetime(1899,12,30)
+            dt = base + timedelta(days=num)
+            return f"{dt.month}/{dt.day}/{dt.year}"
     except Exception:
         pass
-    for pat in DATE_PATTERNS:
+
+    # 2) pandas.to_datetime (infer + dayfirst variando)
+    for day_first in (False, True):
         try:
-            dt = datetime.strptime(s, pat)
-            return f"{dt.month}/{dt.day}/{dt.year}"
+            dt = pd.to_datetime(s, dayfirst=day_first, errors="coerce", utc=False, infer_datetime_format=True)
+            if pd.notna(dt):
+                if isinstance(dt, pd.Timestamp):
+                    d = dt.to_pydatetime()
+                else:
+                    d = dt[0].to_pydatetime()
+                return f"{d.month}/{d.day}/{d.year}"
         except Exception:
             continue
-    if len(s)==8 and s.isdigit():
-        y,m,d = s[0:4], s[4:6], s[6:8]
-        return f"{int(m)}/{int(d)}/{int(y)}"
-    raise ValueError(f"No se reconoce formato de fecha: {s}")
+
+    # 3) YYYYMMDD crudo
+    if len(s) == 8 and s.isdigit():
+        try:
+            y, m, d = int(s[0:4]), int(s[4:6]), int(s[6:8])
+            return f"{m}/{d}/{y}"
+        except Exception:
+            pass
+
+    return ""  # nunca lanzamos excepción
 
 def fmt_amount(x):
     s = str(x).strip()
@@ -68,15 +108,18 @@ def normalize_row(row):
     mes_nombre, gl_month = month_name_es(row['GL_Month'])
     gl_year = str(int(float(row['GL_Year']))) if str(row['GL_Year']).strip()!='' else ''
     gl_group = strip_accents(str(row.get('GL_Group','')).strip())
-    trx_date = parse_date(row['TransactionDate'])
+    trx_date = parse_date_any(row.get('TransactionDate'), month=row.get('GL_Month'), year=row.get('GL_Year'))
     debit = fmt_amount(row['DebitAmount'])
     credit = fmt_amount(row['CreditAmount'])
     job = str(row['JobNumber']).strip()
     gl_note = strip_accents(f"Provisión {mes_nombre}")
     gl_reference = strip_accents(f"Provisión producción {mes_nombre} {gl_year}")
-    return {'GL_Account': gl_account, 'GL_Note': gl_note, 'GL_Month': gl_month, 'GL_Year': gl_year,
-            'GL_Group': gl_group, 'TransactionDate': trx_date, 'GL_Reference': gl_reference,
-            'DebitAmount': debit, 'CreditAmount': credit, 'JobNumber': job}
+    return {
+        'GL_Account': gl_account, 'GL_Note': gl_note,
+        'GL_Month': gl_month, 'GL_Year': gl_year, 'GL_Group': gl_group,
+        'TransactionDate': trx_date, 'GL_Reference': gl_reference,
+        'DebitAmount': debit, 'CreditAmount': credit, 'JobNumber': job
+    }
 
 def add_auto_offsets(rows, offset_account='1300102.5', agg='total'):
     base_rows = [normalize_row(r) for r in rows]
@@ -112,14 +155,14 @@ def strip_accents_local(s):
     return "".join(ch for ch in unicodedata.normalize("NFD", str(s)) if not unicodedata.combining(ch))
 
 def normalize_cols(cols):
-    out=[]; 
+    out=[]
     for c in cols:
         c0=strip_accents_local(str(c)).lower().strip()
         c0=re.sub(r'[^a-z0-9]+','_', c0)
         out.append(c0)
     return out
 
-# ---------- Billing transform ----------
+# ---------- Transformación Billing -> requerido ----------
 def transform_billing_to_required(df_raw):
     df = df_raw.copy(); df.columns = normalize_cols(df.columns)
     candidates = {
@@ -129,30 +172,65 @@ def transform_billing_to_required(df_raw):
         "venta":  ["venta","creditamount","credito","crédito","monto_venta","monto","importe","total","valor","neto"],
         "trabajo":["trabajo","jobnumber","job","proyecto","orden_de_trabajo","ot","orden_trabajo","job_number"]
     }
-    def pick(keys): 
+    def pick(keys):
         for k in keys:
             if k in df.columns: return k
         return None
-    c_codigo = pick(candidates["codigo"]); c_mes = pick(candidates["mes"]); c_fecha = pick(candidates["fecha"])
-    c_venta  = pick(candidates["venta"]);  c_trab = pick(candidates["trabajo"])
+
+    c_codigo = pick(candidates["codigo"]); c_mes = pick(candidates["mes"])
+    c_fecha  = pick(candidates["fecha"]);  c_venta = pick(candidates["venta"])
+    c_trab   = pick(candidates["trabajo"])
+
     out = pd.DataFrame()
     out["GL_Account"] = df[c_codigo] if c_codigo else ""
+
+    # Fecha normalizada (tolerante)
     if c_fecha:
-        fechas_norm = df[c_fecha].apply(lambda v: parse_date(v) if str(v).strip()!="" else "")
+        fechas_norm = df[c_fecha].apply(lambda v: parse_date_any(v))
         out["TransactionDate"] = fechas_norm
-        out["GL_Year"] = fechas_norm.apply(lambda s: datetime.strptime(s,"%m/%d/%Y").year if s else "")
+
+        def _year(s):
+            try:
+                dt = datetime.strptime(s, "%m/%d/%Y"); return dt.year
+            except Exception:
+                return ""
+        def _month(s):
+            try:
+                dt = datetime.strptime(s, "%m/%d/%Y"); return dt.month
+            except Exception:
+                return ""
+
+        out["GL_Year"]  = fechas_norm.apply(_year)
         if c_mes:
             out["GL_Month"] = df[c_mes]
         else:
-            out["GL_Month"] = fechas_norm.apply(lambda s: datetime.strptime(s,"%m/%d/%Y").month if s else "")
+            out["GL_Month"] = fechas_norm.apply(_month)
     else:
         out["TransactionDate"] = ""; out["GL_Year"] = ""; out["GL_Month"] = ""
-    out["GL_Group"] = ""; out["DebitAmount"] = 0
-    out["CreditAmount"] = (pd.to_numeric(df[c_venta].astype(str).str.replace(" ","").str.replace(",",""), errors="coerce").fillna(0) if c_venta else 0)
+
+    out["GL_Group"] = ""
+    out["DebitAmount"] = 0
+    out["CreditAmount"] = (pd.to_numeric(
+        (df[c_venta] if c_venta else 0).astype(str).str.replace(" ","").str.replace(",",""),
+        errors="coerce").fillna(0) if c_venta else 0)
     out["JobNumber"] = df[c_trab] if c_trab else ""
+
     out = out[REQUIRED_COLUMNS].copy()
-    def _i(x): sx=str(x).strip(); return "" if sx in ("","nan","None") else int(float(sx))
-    out["GL_Month"] = out["GL_Month"].apply(_i); out["GL_Year"] = out["GL_Year"].apply(_i)
+
+    def _int_or_blank(x):
+        sx=str(x).strip()
+        if sx in ("","nan","none","None","NaN"): return ""
+        return int(float(sx))
+    out["GL_Month"] = out["GL_Month"].apply(_int_or_blank)
+    out["GL_Year"]  = out["GL_Year"].apply(_int_or_blank)
+
+    # Si TransactionDate está vacío pero hay Mes/Año -> fabricar último día del mes
+    def _fill_date(row):
+        if str(row["TransactionDate"]).strip()=="" and row["GL_Month"]!="" and row["GL_Year"]!="":
+            return parse_date_any("", month=row["GL_Month"], year=row["GL_Year"])
+        return row["TransactionDate"]
+    out["TransactionDate"] = out.apply(_fill_date, axis=1)
+
     return out
 
 # ---------- AGENCIAS ----------
@@ -160,7 +238,13 @@ def _read_agency_df(path: Path):
     try:
         if path.suffix.lower()==".xlsx":
             return pd.read_excel(path, dtype=str)
-        return pd.read_csv(path, dtype=str, keep_default_na=False, sep=None, engine="python")
+        # CSV con autodetección de separador y encodings comunes
+        for enc in ("utf-8-sig","cp1252","latin1"):
+            try:
+                return pd.read_csv(path, dtype=str, keep_default_na=False, sep=None, engine="python", encoding=enc)
+            except Exception:
+                continue
+        return None
     except Exception:
         return None
 
@@ -178,7 +262,11 @@ def _build_agency_map(df: pd.DataFrame):
 
 def load_agencies():
     base = Path(__file__).parent
-    paths = [base/"agencias.csv", base/"agencias.xlsx", base/"data"/"agencias.csv", base/"data"/"agencias.xlsx", base/"assets"/"agencias.csv", base/"assets"/"agencias.xlsx"]
+    paths = [
+        base/"agencias.csv", base/"agencias.xlsx",
+        base/"data"/"agencias.csv", base/"data"/"agencias.xlsx",
+        base/"assets"/"agencias.csv", base/"assets"/"agencias.xlsx"
+    ]
     for p in paths:
         if p.exists():
             df = _read_agency_df(p)
@@ -227,6 +315,7 @@ if run:
     if not file:
         st.error("Sube un archivo primero."); st.stop()
     try:
+        # Leer Billing original
         if file.name.lower().endswith('.csv'):
             raw = file.getvalue(); df_in = None
             for enc in ('utf-8-sig','cp1252','latin1'):
@@ -241,6 +330,7 @@ if run:
 
         st.subheader("Vista previa - Billing original"); st.dataframe(df_in.head(20))
 
+        # Transformar si hace falta
         missing = ensure_headers(df_in.copy())
         df_req = transform_billing_to_required(df_in) if missing else df_in.copy()
 
@@ -252,6 +342,7 @@ if run:
 
         d,c,diff = totals(out_rows)
 
+        # Construir TXT
         out_buffer = io.StringIO()
         for r in out_rows:
             fields = [r['GL_Account'], r['GL_Note'], r['GL_Month'], r['GL_Year'], r['GL_Group'],
