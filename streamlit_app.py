@@ -143,7 +143,7 @@ def normalize_row(row):
                 gl_year_val = ""
     else:
         try:
-            gl_year_val = str(int(float(gl_year_val)))
+            gl_year_val = str(int(float(gl_year_val))))
         except Exception:
             s = parse_date_any(trx_date_raw, month=gl_month, year=None)
             if s:
@@ -209,6 +209,43 @@ def normalize_cols(cols):
         c0=re.sub(r'[^a-z0-9]+','_', c0)
         out.append(c0)
     return out
+
+# ---------- Filtros de filas vacías ----------
+def _cell_blank(x) -> bool:
+    if x is None:
+        return True
+    s = str(x).strip().lower()
+    return s in ("", "nan", "none", "null")
+
+def drop_empty_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Quita filas completamente vacías del Billing original."""
+    if df.empty:
+        return df
+    mask_all_blank = df.applymap(_cell_blank).all(axis=1)
+    return df.loc[~mask_all_blank].reset_index(drop=True)
+
+def drop_empty_transformed(df: pd.DataFrame) -> pd.DataFrame:
+    """Quita filas vacías o sin monto del formateado (REQUIRED_COLUMNS)."""
+    if df.empty:
+        return df
+
+    def _zero_or_blank_amount(x):
+        s = str(x).strip()
+        if _cell_blank(s):
+            return True
+        try:
+            return float(s) == 0.0
+        except Exception:
+            return True
+
+    mask_empty = (
+        df["GL_Account"].apply(_cell_blank)
+        & df["TransactionDate"].apply(_cell_blank)
+        & df["JobNumber"].apply(_cell_blank)
+        & df["CreditAmount"].apply(_zero_or_blank_amount)
+        & df["DebitAmount"].apply(_zero_or_blank_amount)
+    )
+    return df.loc[~mask_empty].reset_index(drop=True)
 
 # ---------- Transformación Billing -> requerido ----------
 def transform_billing_to_required(df_raw):
@@ -376,13 +413,21 @@ if run:
         else:
             df_in = pd.read_excel(file, dtype=str)
 
-        st.subheader("Vista previa - Billing original"); st.dataframe(df_in.head(20))
+        # ➜ NUEVO: eliminar filas completamente vacías del Billing original
+        df_in = drop_empty_rows(df_in)
+
+        st.subheader("Vista previa - Billing original")
+        st.dataframe(df_in.head(20))
 
         # Transformar si hace falta
         missing = ensure_headers(df_in.copy())
         df_req = transform_billing_to_required(df_in) if missing else df_in.copy()
 
-        st.subheader("Vista previa - Billing_formateado (intermedio)"); st.dataframe(df_req.head(20))
+        # ➜ NUEVO: eliminar filas vacías/sin monto del formateado
+        df_req = drop_empty_transformed(df_req)
+
+        st.subheader("Vista previa - Billing_formateado (intermedio)")
+        st.dataframe(df_req.head(20))
 
         rows = df_req.to_dict(orient='records')
         effective_offset = offset_account_from_agency if (use_agency_account and offset_account_from_agency) else offset_account_manual
